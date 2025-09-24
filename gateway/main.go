@@ -16,16 +16,12 @@ import (
 )
 
 type ScanResult struct{ Score float64 `json:"score"`; Reasons []string `json:"reasons"` }
-type SandResp struct {
-  Syscalls []string `json:"syscalls"`; FileWrites []string `json:"file_writes"`
-  NetCalls int `json:"net_calls"`; ExecCalls int `json:"exec_calls"`
-  ExitCode int `json:"exit_code"`; DurationMs int `json:"duration_ms"`
-}
+type SandResp struct{ Syscalls []string `json:"syscalls"`; FileWrites []string `json:"file_writes"`; NetCalls,ExecCalls,ExitCode,DurationMs int }
 type Decision struct {
   Decision string `json:"decision"`; Scores map[string]float64 `json:"scores"`
   PoliciesTriggered []string `json:"policies_triggered"`; WaiverID *string `json:"waiver_id"`
   SignedValid bool `json:"signed_valid"`; SbomPresent bool `json:"sbom_present"`
-  SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"`
+  SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"`; AttArtifact string `json:"att_artifact_sha256"`
 }
 
 func health(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type","application/json"); io.WriteString(w, `{"status":"ok"}`) }
@@ -90,19 +86,26 @@ func verify(w http.ResponseWriter, r *http.Request) {
     sigPath = sp.Name()
   }
 
-  // optional attestation (JSON: {slsa_level:int, builder_id:string})
+  // optional attestation
   slsaLevel := 0
   builderID := ""
+  attArtifact := ""
   if att, _, _ := r.FormFile("att"); att != nil {
     defer att.Close()
-    var attObj struct{ SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"` }
-    _ = json.NewDecoder(att).Decode(&attObj)
-    slsaLevel = attObj.SlsaLevel
-    builderID = attObj.BuilderID
+    var a struct {
+      SlsaLevel int    `json:"slsa_level"`
+      BuilderID string `json:"builder_id"`
+      ArtifactSHA256 string `json:"artifact_sha256"`
+    }
+    _ = json.NewDecoder(att).Decode(&a)
+    slsaLevel = a.SlsaLevel
+    builderID = a.BuilderID
+    attArtifact = a.ArtifactSHA256
   }
 
   tmpf, _ := os.CreateTemp("", "art-*"); io.Copy(tmpf, file); tmpf.Close()
   artPath := tmpf.Name()
+  artifactSHA, _ := sha256File(artPath)
 
   pkgURL := getenv("PKG_SCANNER", "http://127.0.0.1:8081/scan/package")
   modelURL := getenv("MODEL_SCANNER", "http://127.0.0.1:8082/scan/model")
@@ -126,7 +129,6 @@ func verify(w http.ResponseWriter, r *http.Request) {
 
   // sbom
   sbomPresent := false
-  artifactSHA, _ := sha256File(artPath)
   if _, err := exec.LookPath("syft"); err == nil {
     _, err := run("syft", "-q", "-o", "spdx-json=/dev/stdout", artPath)
     sbomPresent = (err == nil)
@@ -136,7 +138,9 @@ func verify(w http.ResponseWriter, r *http.Request) {
   input := map[string]any{
     "artifact": map[string]any{ "sha256": artifactSHA, "type": kind },
     "signatures": map[string]any{ "valid": sigValid },
-    "provenance": map[string]any{ "slsa_level": slsaLevel, "builder_id": builderID },
+    "provenance": map[string]any{
+      "slsa_level": slsaLevel, "builder_id": builderID, "artifact_sha256": attArtifact,
+    },
     "sbom": map[string]any{ "present": sbomPresent, "artifact_digest": artifactSHA },
     "package": map[string]any{ "has_post_install": false, "has_native_loader": false, "native_loader_allowed": false },
     "model": map[string]any{ "has_disallowed_ops": false, "has_custom_ops": false },
@@ -164,6 +168,7 @@ func verify(w http.ResponseWriter, r *http.Request) {
     SbomPresent: sbomPresent,
     SlsaLevel: slsaLevel,
     BuilderID: builderID,
+    AttArtifact: attArtifact,
   })
 }
 
