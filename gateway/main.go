@@ -16,6 +16,12 @@ import (
 )
 
 type ScanResult struct{ Score float64 `json:"score"`; Reasons []string `json:"reasons"` }
+type ModelScanResult struct {
+  Score float64 `json:"score"`; Reasons []string `json:"reasons"`
+  HasDisallowedOps bool `json:"has_disallowed_ops"`
+  HasCustomOps bool `json:"has_custom_ops"`
+  OpsList []string `json:"ops_list"`
+}
 type SandResp struct{ Syscalls []string `json:"syscalls"`; FileWrites []string `json:"file_writes"`; NetCalls,ExecCalls,ExitCode,DurationMs int }
 type Decision struct {
   Decision string `json:"decision"`; Scores map[string]float64 `json:"scores"`
@@ -48,10 +54,18 @@ func runSandbox(url, filename string) (*SandResp, error) {
   return &s, nil
 }
 
-func callScanner(url, filename string) (*ScanResult, error) {
+func callPkgScanner(url, filename string) (*ScanResult, error) {
   resp, err := postFile(url, "file", filename); if err != nil { return nil, err }
   defer resp.Body.Close()
   var r ScanResult
+  if err := json.NewDecoder(resp.Body).Decode(&r); err != nil { return nil, err }
+  return &r, nil
+}
+
+func callModelScanner(url, filename string) (*ModelScanResult, error) {
+  resp, err := postFile(url, "file", filename); if err != nil { return nil, err }
+  defer resp.Body.Close()
+  var r ModelScanResult
   if err := json.NewDecoder(resp.Body).Decode(&r); err != nil { return nil, err }
   return &r, nil
 }
@@ -78,7 +92,6 @@ func verify(w http.ResponseWriter, r *http.Request) {
   file, _, err := r.FormFile("file"); if err != nil { http.Error(w, "missing file", 400); return }
   defer file.Close()
 
-  // optional signature
   var sigPath string
   if sig, _, _ := r.FormFile("sig"); sig != nil {
     defer sig.Close()
@@ -86,21 +99,14 @@ func verify(w http.ResponseWriter, r *http.Request) {
     sigPath = sp.Name()
   }
 
-  // optional attestation
   slsaLevel := 0
   builderID := ""
   attArtifact := ""
   if att, _, _ := r.FormFile("att"); att != nil {
     defer att.Close()
-    var a struct {
-      SlsaLevel int    `json:"slsa_level"`
-      BuilderID string `json:"builder_id"`
-      ArtifactSHA256 string `json:"artifact_sha256"`
-    }
+    var a struct{ SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"`; ArtifactSHA256 string `json:"artifact_sha256"` }
     _ = json.NewDecoder(att).Decode(&a)
-    slsaLevel = a.SlsaLevel
-    builderID = a.BuilderID
-    attArtifact = a.ArtifactSHA256
+    slsaLevel = a.SlsaLevel; builderID = a.BuilderID; attArtifact = a.ArtifactSHA256
   }
 
   tmpf, _ := os.CreateTemp("", "art-*"); io.Copy(tmpf, file); tmpf.Close()
@@ -111,9 +117,21 @@ func verify(w http.ResponseWriter, r *http.Request) {
   modelURL := getenv("MODEL_SCANNER", "http://127.0.0.1:8082/scan/model")
   sandURL := getenv("SANDBOX", "http://127.0.0.1:8083/sandbox/run")
 
-  var scan *ScanResult
-  if kind == "model" { scan, err = callScanner(modelURL, artPath) } else { scan, err = callScanner(pkgURL, artPath) }
-  if err != nil { http.Error(w, "scanner error: "+err.Error(), 500); return }
+  // scanners
+  var scanScore float64
+  hasDisallowedOps := false
+  hasCustomOps := false
+  if kind == "model" {
+    ms, err := callModelScanner(modelURL, artPath)
+    if err != nil { http.Error(w, "scanner error: "+err.Error(), 500); return }
+    scanScore = ms.Score
+    hasDisallowedOps = ms.HasDisallowedOps
+    hasCustomOps = ms.HasCustomOps
+  } else {
+    ps, err := callPkgScanner(pkgURL, artPath)
+    if err != nil { http.Error(w, "scanner error: "+err.Error(), 500); return }
+    scanScore = ps.Score
+  }
 
   sres, err := runSandbox(sandURL, artPath); if err != nil { http.Error(w, "sandbox error: "+err.Error(), 500); return }
 
@@ -143,9 +161,9 @@ func verify(w http.ResponseWriter, r *http.Request) {
     },
     "sbom": map[string]any{ "present": sbomPresent, "artifact_digest": artifactSHA },
     "package": map[string]any{ "has_post_install": false, "has_native_loader": false, "native_loader_allowed": false },
-    "model": map[string]any{ "has_disallowed_ops": false, "has_custom_ops": false },
+    "model": map[string]any{ "has_disallowed_ops": hasDisallowedOps, "has_custom_ops": hasCustomOps },
     "sandbox": map[string]any{ "net_calls": sres.NetCalls, "exec_calls": sres.ExecCalls },
-    "scores": map[string]any{ "scanner": scan.Score },
+    "scores": map[string]any{ "scanner": scanScore },
   }
 
   inbytes, _ := json.Marshal(input)
@@ -161,14 +179,10 @@ func verify(w http.ResponseWriter, r *http.Request) {
   w.Header().Set("Content-Type","application/json")
   json.NewEncoder(w).Encode(Decision{
     Decision: decision,
-    Scores: map[string]float64{"scanner": scan.Score},
-    PoliciesTriggered: []string{},
-    WaiverID: nil,
-    SignedValid: sigValid,
-    SbomPresent: sbomPresent,
-    SlsaLevel: slsaLevel,
-    BuilderID: builderID,
-    AttArtifact: attArtifact,
+    Scores: map[string]float64{"scanner": scanScore},
+    PoliciesTriggered: []string{}, WaiverID: nil,
+    SignedValid: sigValid, SbomPresent: sbomPresent,
+    SlsaLevel: slsaLevel, BuilderID: builderID, AttArtifact: attArtifact,
   })
 }
 
