@@ -1,0 +1,75 @@
+name: release-artifacts
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+
+      - name: Build gateway (binary)
+        run: |
+          cd gateway && go build -o ../gateway_bin
+          sha256sum ../gateway_bin | tee gateway_bin.sha256
+
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          syft version
+
+      - name: SBOM (gateway_bin)
+        run: |
+          syft -q -o spdx-json=sbom.gateway_bin.spdx.json ./gateway_bin
+          test -s sbom.gateway_bin.spdx.json
+
+      - name: Restore cosign key from secret
+        env:
+          COSIGN_PRIVATE_KEY_B64: ${{ secrets.COSIGN_PRIVATE_KEY_B64 }}
+        run: |
+          echo "$COSIGN_PRIVATE_KEY_B64" | base64 -d > cosign.key
+
+      - name: Sign artifact with cosign
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          curl -sSL -o cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x cosign
+          ./cosign version
+          ./cosign sign-blob --yes --key cosign.key --output-signature gateway_bin.sig gateway_bin
+          test -s gateway_bin.sig
+
+      - name: Generate provenance (SLSA-ish JSON)
+        id: prov
+        run: |
+          ART_SHA=$(sha256sum gateway_bin | awk '{print $1}')
+          cat > provenance.json <<JSON
+          {
+            "slsa_level": 3,
+            "builder_id": "github/${{ github.repository }}/actions",
+            "artifact_sha256": "${ART_SHA}",
+            "commit": "${{ github.sha }}",
+            "workflow": "${{ github.workflow }}",
+            "run_id": "${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          jq . provenance.json
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trust-gateway-${{ github.ref_name }}
+          path: |
+            gateway_bin
+            gateway_bin.sha256
+            gateway_bin.sig
+            sbom.gateway_bin.spdx.json
+            provenance.json
