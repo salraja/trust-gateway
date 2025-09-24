@@ -2,6 +2,8 @@ package main
 
 import (
   "bytes"
+  "crypto/sha256"
+  "encoding/hex"
   "encoding/json"
   "io"
   "log"
@@ -9,39 +11,30 @@ import (
   "net/http"
   "os"
   "os/exec"
+  "path/filepath"
   "time"
 )
 
-type ScanResult struct {
-  Score   float64  `json:"score"`
-  Reasons []string `json:"reasons"`
-}
+type ScanResult struct{ Score float64 `json:"score"`; Reasons []string `json:"reasons"` }
 type SandResp struct {
-  Syscalls   []string `json:"syscalls"`
-  FileWrites []string `json:"file_writes"`
-  NetCalls   int      `json:"net_calls"`
-  ExecCalls  int      `json:"exec_calls"`
-  ExitCode   int      `json:"exit_code"`
-  DurationMs int      `json:"duration_ms"`
+  Syscalls []string `json:"syscalls"`; FileWrites []string `json:"file_writes"`
+  NetCalls int `json:"net_calls"`; ExecCalls int `json:"exec_calls"`
+  ExitCode int `json:"exit_code"`; DurationMs int `json:"duration_ms"`
 }
 type Decision struct {
-  Decision          string             `json:"decision"`
-  Scores            map[string]float64 `json:"scores"`
-  PoliciesTriggered []string           `json:"policies_triggered"`
-  WaiverID          *string            `json:"waiver_id"`
+  Decision string `json:"decision"`; Scores map[string]float64 `json:"scores"`
+  PoliciesTriggered []string `json:"policies_triggered"`; WaiverID *string `json:"waiver_id"`
+  SignedValid bool `json:"signed_valid"`; SbomPresent bool `json:"sbom_present"`
+  SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"`
 }
 
-func health(w http.ResponseWriter, _ *http.Request) {
-  w.Header().Set("Content-Type", "application/json")
-  io.WriteString(w, `{"status":"ok"}`)
-}
+func health(w http.ResponseWriter, _ *http.Request) { w.Header().Set("Content-Type","application/json"); io.WriteString(w, `{"status":"ok"}`) }
 
 func postFile(url, field, filename string) (*http.Response, error) {
   var b bytes.Buffer
   mw := multipart.NewWriter(&b)
-  fw, _ := mw.CreateFormFile(field, filename)
-  f, err := os.Open(filename)
-  if err != nil { return nil, err }
+  fw, _ := mw.CreateFormFile(field, filepath.Base(filename))
+  f, err := os.Open(filename); if err != nil { return nil, err }
   defer f.Close()
   if _, err := io.Copy(fw, f); err != nil { return nil, err }
   mw.Close()
@@ -52,8 +45,7 @@ func postFile(url, field, filename string) (*http.Response, error) {
 }
 
 func runSandbox(url, filename string) (*SandResp, error) {
-  resp, err := postFile(url, "file", filename)
-  if err != nil { return nil, err }
+  resp, err := postFile(url, "file", filename); if err != nil { return nil, err }
   defer resp.Body.Close()
   var s SandResp
   if err := json.NewDecoder(resp.Body).Decode(&s); err != nil { return nil, err }
@@ -61,84 +53,106 @@ func runSandbox(url, filename string) (*SandResp, error) {
 }
 
 func callScanner(url, filename string) (*ScanResult, error) {
-  resp, err := postFile(url, "file", filename)
-  if err != nil { return nil, err }
+  resp, err := postFile(url, "file", filename); if err != nil { return nil, err }
   defer resp.Body.Close()
   var r ScanResult
   if err := json.NewDecoder(resp.Body).Decode(&r); err != nil { return nil, err }
   return &r, nil
 }
 
+func sha256File(path string) (string, error) {
+  f, err := os.Open(path); if err != nil { return "", err }
+  defer f.Close()
+  h := sha256.New()
+  if _, err := io.Copy(h, f); err != nil { return "", err }
+  return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func run(cmd string, args ...string) (string, error) {
+  c := exec.Command(cmd, args...); c.Env = os.Environ()
+  out, err := c.CombinedOutput()
+  if err != nil { return string(out), err }
+  return string(out), nil
+}
+
 func verify(w http.ResponseWriter, r *http.Request) {
-  if err := r.ParseMultipartForm(64 << 20); err != nil {
-    http.Error(w, err.Error(), 400); return
-  }
+  if err := r.ParseMultipartForm(64<<20); err != nil { http.Error(w, err.Error(), 400); return }
   kind := r.FormValue("type")
-  file, _, err := r.FormFile("file")
-  if err != nil { http.Error(w, "missing file", 400); return }
+
+  file, _, err := r.FormFile("file"); if err != nil { http.Error(w, "missing file", 400); return }
   defer file.Close()
 
-  tmp := "tmp_artifact.bin"
-  out, _ := os.Create(tmp)
-  io.Copy(out, file)
-  out.Close()
+  // optional signature
+  var sigPath string
+  if sig, _, _ := r.FormFile("sig"); sig != nil {
+    defer sig.Close()
+    sp, _ := os.CreateTemp("", "sig-*.sig"); io.Copy(sp, sig); sp.Close()
+    sigPath = sp.Name()
+  }
+
+  // optional attestation (JSON: {slsa_level:int, builder_id:string})
+  slsaLevel := 0
+  builderID := ""
+  if att, _, _ := r.FormFile("att"); att != nil {
+    defer att.Close()
+    var attObj struct{ SlsaLevel int `json:"slsa_level"`; BuilderID string `json:"builder_id"` }
+    _ = json.NewDecoder(att).Decode(&attObj)
+    slsaLevel = attObj.SlsaLevel
+    builderID = attObj.BuilderID
+  }
+
+  tmpf, _ := os.CreateTemp("", "art-*"); io.Copy(tmpf, file); tmpf.Close()
+  artPath := tmpf.Name()
 
   pkgURL := getenv("PKG_SCANNER", "http://127.0.0.1:8081/scan/package")
   modelURL := getenv("MODEL_SCANNER", "http://127.0.0.1:8082/scan/model")
   sandURL := getenv("SANDBOX", "http://127.0.0.1:8083/sandbox/run")
 
   var scan *ScanResult
-  if kind == "model" {
-    scan, err = callScanner(modelURL, tmp)
-  } else {
-    scan, err = callScanner(pkgURL, tmp)
-  }
+  if kind == "model" { scan, err = callScanner(modelURL, artPath) } else { scan, err = callScanner(pkgURL, artPath) }
   if err != nil { http.Error(w, "scanner error: "+err.Error(), 500); return }
 
-  sres, err := runSandbox(sandURL, tmp)
-  if err != nil { http.Error(w, "sandbox error: "+err.Error(), 500); return }
+  sres, err := runSandbox(sandURL, artPath); if err != nil { http.Error(w, "sandbox error: "+err.Error(), 500); return }
 
+  // signature
+  sigValid := false
+  pub := getenv("COSIGN_PUBLIC_KEYS_PATH", "infra/trust/cosign.pub")
+  if sigPath != "" {
+    if _, err := os.Stat(pub); err == nil {
+      _, err := run("cosign", "verify-blob", "--key", pub, "--signature", sigPath, artPath)
+      sigValid = (err == nil)
+    }
+  }
+
+  // sbom
+  sbomPresent := false
+  artifactSHA, _ := sha256File(artPath)
+  if _, err := exec.LookPath("syft"); err == nil {
+    _, err := run("syft", "-q", "-o", "spdx-json=/dev/stdout", artPath)
+    sbomPresent = (err == nil)
+  }
+
+  // OPA input
   input := map[string]any{
-    "dev_mode": false,
-    "artifact": map[string]any{ "sha256": "dev", "type": kind },
-    "signatures": map[string]any{ "valid": false },
-    "provenance": map[string]any{ "slsa_level": 0, "builder_id": "" },
-    "sbom": map[string]any{ "present": false, "artifact_digest": "dev" },
-    "package": map[string]any{
-      "has_post_install": false,
-      "has_native_loader": false,
-      "native_loader_allowed": false,
-    },
-    "model": map[string]any{
-      "has_disallowed_ops": false,
-      "has_custom_ops": false,
-    },
-    "sandbox": map[string]any{
-      "net_calls": sres.NetCalls,
-      "exec_calls": sres.ExecCalls,
-    },
-    "scores": map[string]any{
-      "scanner": scan.Score,
-    },
+    "artifact": map[string]any{ "sha256": artifactSHA, "type": kind },
+    "signatures": map[string]any{ "valid": sigValid },
+    "provenance": map[string]any{ "slsa_level": slsaLevel, "builder_id": builderID },
+    "sbom": map[string]any{ "present": sbomPresent, "artifact_digest": artifactSHA },
+    "package": map[string]any{ "has_post_install": false, "has_native_loader": false, "native_loader_allowed": false },
+    "model": map[string]any{ "has_disallowed_ops": false, "has_custom_ops": false },
+    "sandbox": map[string]any{ "net_calls": sres.NetCalls, "exec_calls": sres.ExecCalls },
+    "scores": map[string]any{ "scanner": scan.Score },
   }
 
   inbytes, _ := json.Marshal(input)
   cmd := exec.Command("opa", "eval", "-I", "-f", "json", "-d", "policies/policy.rego", "data.trustgw.allow")
   cmd.Stdin = bytes.NewReader(inbytes)
-  outOPA, err := cmd.Output()
-  if err != nil { http.Error(w, "opa eval error: "+err.Error(), 500); return }
+  outOPA, err := cmd.Output(); if err != nil { http.Error(w, "opa eval error: "+err.Error(), 500); return }
 
-  var or struct {
-    Result []struct{
-      Expressions []struct{ Value bool `json:"value"` } `json:"expressions"`
-    } `json:"result"`
-  }
+  var or struct{ Result []struct{ Expressions []struct{ Value bool `json:"value"` } `json:"expressions"` } `json:"result"` }
   if err := json.Unmarshal(outOPA, &or); err != nil { http.Error(w, "opa parse error", 500); return }
-
   decision := "block"
-  if len(or.Result) > 0 && len(or.Result[0].Expressions) > 0 && or.Result[0].Expressions[0].Value {
-    decision = "allow"
-  }
+  if len(or.Result) > 0 && len(or.Result[0].Expressions) > 0 && or.Result[0].Expressions[0].Value { decision = "allow" }
 
   w.Header().Set("Content-Type","application/json")
   json.NewEncoder(w).Encode(Decision{
@@ -146,13 +160,14 @@ func verify(w http.ResponseWriter, r *http.Request) {
     Scores: map[string]float64{"scanner": scan.Score},
     PoliciesTriggered: []string{},
     WaiverID: nil,
+    SignedValid: sigValid,
+    SbomPresent: sbomPresent,
+    SlsaLevel: slsaLevel,
+    BuilderID: builderID,
   })
 }
 
-func getenv(k, def string) string {
-  if v := os.Getenv(k); v != "" { return v }
-  return def
-}
+func getenv(k, def string) string { if v := os.Getenv(k); v != "" { return v }; return def }
 
 func main() {
   http.HandleFunc("/health", health)
